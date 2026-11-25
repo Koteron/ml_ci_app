@@ -1,4 +1,3 @@
-// auth.service.ts
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { Router } from '@angular/router';
@@ -8,7 +7,7 @@ import { tap } from 'rxjs';
 export class AuthService {
   private http = inject(HttpClient);
   private router = inject(Router);
-  private apiUrl = 'http://localhost:8000/auth';
+  private apiUrl = 'http://45.128.96.119:8000/auth';
 
   register(email: string, password: string) {
     return this.http

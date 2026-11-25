@@ -19,10 +19,8 @@ from .rabbitmq import publish_generation_task, consume_results
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Создаем таблицы при старте (для продакшена лучше использовать Alembic)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # Запускаем фоновый консьюмер ответов от NN-сервиса
     consumer_task = asyncio.create_task(consume_results())
     yield
     consumer_task.cancel()
@@ -30,16 +28,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Wiki TextGen User & Chat Service", lifespan=lifespan)
 
+ALLOWED_ORIGINS = [
+    "http://localhost:4200",
+    "http://45.128.96.119:4200",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # На этапе разработки разрешаем Angular (localhost:4200)
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# --- АВТОРИЗАЦИЯ ---
 
 @app.post("/auth/register", response_model=TokenResponse, status_code=201)
 async def register(data: UserCreate, db: AsyncSession = Depends(get_db)):
@@ -62,8 +63,6 @@ async def login(form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = 
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
     return TokenResponse(access_token=create_access_token(user.id))
 
-
-# --- УПРАВЛЕНИЕ ЧАТАМИ ---
 
 @app.get("/chats", response_model=list[ChatOut])
 async def get_user_chats(
@@ -107,8 +106,6 @@ async def delete_chat(
     await db.commit()
 
 
-# --- СООБЩЕНИЯ И ГЕНЕРАЦИЯ ВНУТРИ ЧАТА ---
-
 @app.get("/chats/{chat_id}/messages", response_model=list[MessageOut])
 async def get_chat_messages(
     chat_id: UUID,
@@ -142,11 +139,9 @@ async def send_message(
     if not chat:
         raise HTTPException(status_code=404, detail="Чат не найден")
 
-    # 1. Если это первое сообщение в чате, обновляем заголовок чата
     if len(chat.messages) == 0:
         chat.title = payload.content[:45] + ("..." if len(payload.content) > 45 else "")
 
-    # 2. Сохраняем сообщение пользователя
     user_msg = Message(
         chat_id=chat.id,
         role="user",
@@ -155,12 +150,10 @@ async def send_message(
     )
     db.add(user_msg)
 
-    # 3. Собираем контекст из последних 3 завершенных сообщений + нового запроса
     recent_history = [m.content for m in chat.messages[-3:] if m.status == "COMPLETED"]
     recent_history.append(payload.content)
     compiled_prompt = "\n".join(recent_history)
 
-    # 4. Создаем заготовку ответа ассистента со статусом PENDING (его ID = task_id)
     params_dict = payload.params.model_dump()
     assistant_msg = Message(
         chat_id=chat.id,
@@ -173,7 +166,6 @@ async def send_message(
     await db.commit()
     await db.refresh(assistant_msg)
 
-    # 5. Отправляем задачу в RabbitMQ
     await publish_generation_task(
         task_id=assistant_msg.id,
         prompt=compiled_prompt,

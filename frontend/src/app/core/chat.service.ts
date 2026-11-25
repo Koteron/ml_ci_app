@@ -6,7 +6,7 @@ import { Chat, Message, GenerationParams } from './models';
 @Injectable({ providedIn: 'root' })
 export class ChatService {
   private http = inject(HttpClient);
-  private apiUrl = 'http://localhost:8000/chats';
+  private apiUrl = 'http://45.128.96.119:8000/chats';
 
   getChats() {
     return this.http.get<Chat[]>(this.apiUrl);
