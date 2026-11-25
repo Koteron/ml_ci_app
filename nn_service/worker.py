@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import threading
 import pika
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -32,7 +33,7 @@ class TextGenerator:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
         ).to(self.device)
         self.model.eval()
         logging.info("Модель успешно загружена и готова к работе.")
@@ -77,7 +78,10 @@ class TextGenerator:
 
 def start_worker():
     generator = TextGenerator()
+
     params = pika.URLParameters(RABBITMQ_URL)
+    params.heartbeat = 120
+    params.blocked_connection_timeout = 600
 
     while True:
         try:
@@ -96,31 +100,49 @@ def start_worker():
 
                 logging.info(f"Получена задача {task_id}. Длина промпта: {len(prompt)} симв.")
 
-                try:
-                    generated_text = generator.generate(prompt, gen_params)
-                    response = {
-                        "task_id": task_id,
-                        "status": "COMPLETED",
-                        "result": generated_text,
-                        "error": None,
-                    }
-                except Exception as e:
-                    logging.error(f"Ошибка при генерации для задачи {task_id}: {e}")
-                    response = {
-                        "task_id": task_id,
-                        "status": "FAILED",
-                        "result": None,
-                        "error": str(e),
-                    }
+                def work():
+                    try:
+                        generated_text = generator.generate(prompt, gen_params)
+                        response = {
+                            "task_id": task_id,
+                            "status": "COMPLETED",
+                            "result": generated_text,
+                            "error": None,
+                        }
+                    except Exception as e:
+                        logging.error(f"Ошибка при генерации для задачи {task_id}: {e}")
+                        response = {
+                            "task_id": task_id,
+                            "status": "FAILED",
+                            "result": None,
+                            "error": str(e),
+                        }
 
-                ch.basic_publish(
-                    exchange="",
-                    routing_key=RESULT_QUEUE,
-                    body=json.dumps(response, ensure_ascii=False),
-                    properties=pika.BasicProperties(delivery_mode=2),
-                )
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                logging.info(f"Задача {task_id} завершена со статусом {response['status']}.")
+                    def publish_and_ack():
+                        try:
+                            ch.basic_publish(
+                                exchange="",
+                                routing_key=RESULT_QUEUE,
+                                body=json.dumps(response, ensure_ascii=False),
+                                properties=pika.BasicProperties(delivery_mode=2),
+                            )
+                            ch.basic_ack(delivery_tag=method.delivery_tag)
+                            logging.info(
+                                f"Задача {task_id} завершена со статусом {response['status']}."
+                            )
+                        except Exception as e:
+                            logging.error(
+                                f"Не удалось опубликовать/подтвердить задачу {task_id}: {e}"
+                            )
+
+                    try:
+                        connection.add_callback_threadsafe(publish_and_ack)
+                    except Exception as e:
+                        logging.error(
+                            f"Соединение уже закрыто, результат для {task_id} не отправлен: {e}"
+                        )
+
+                threading.Thread(target=work, daemon=True).start()
 
             channel.basic_consume(queue=TASK_QUEUE, on_message_callback=on_message)
             logging.info("Ожидание задач в очереди RabbitMQ...")
@@ -129,6 +151,9 @@ def start_worker():
         except pika.exceptions.AMQPConnectionError:
             logging.warning("Нет соединения с RabbitMQ. Повтор через 5 секунд...")
             time.sleep(5)
+        except KeyboardInterrupt:
+            logging.info("Остановка по сигналу.")
+            break
 
 
 if __name__ == "__main__":
