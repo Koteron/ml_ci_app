@@ -25,8 +25,11 @@ class TextGenerator:
             model_path=model_path,
             lora_path=lora_path,
             n_ctx=2048,
-            n_threads=4,
-            verbose=False,
+            n_threads=2,        
+            n_threads_batch=2,
+            n_batch=512,
+            use_mmap=True,
+            verbose=True,
         )
 
     def generate(self, prompt: str, params: dict) -> str:
@@ -41,7 +44,8 @@ class TextGenerator:
             temperature=max(float(params.get("temperature", 0.3)), 0.1),
             top_p=float(params.get("top_p", 0.85)),
             top_k=int(params.get("top_k", 40)),
-            stop=["<|im_end|>"],
+            repeat_penalty=1.05,
+            stop=["<|im_end|>", "<|endoftext|>"],
         )
 
         return response["choices"][0]["message"]["content"].strip()
