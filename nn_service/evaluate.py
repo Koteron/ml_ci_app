@@ -1,309 +1,149 @@
-"""
-Оценка качества генерации для проекта Wiki TextGen (nn_service).
-
-Скрипт загружает дообученную модель (или базовую Qwen2.5-1.5B-Instruct),
-генерирует ответы на отложенной выборке Wikipedia RU и вычисляет:
-  - ROUGE (1/2/L)
-  - BLEU
-  - BERTScore (F1, с поддержкой русского)
-  - Perplexity (на эталонных текстах, для causal LM)
-
-Результаты сохраняются в JSON, примеры генерации — отдельно.
-
-Пример запуска:
-    python evaluate_metrics.py \
-        --model_path ./model_weights \
-        --num_samples 200 \
-        --offset 5000 \
-        --output_dir ./eval_results
-"""
-
-import argparse
-import json
-import logging
 import os
 import re
-from pathlib import Path
+import time
+import json
+import sacrebleu
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score
+from llama_cpp import Llama
 
-import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from tqdm import tqdm
-import evaluate
+MODEL_PATH = "./models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+LORA_PATH = "./lora-ru-adapter.gguf"
+VAL_FILE = "./val_dataset.jsonl"
+SYSTEM_PROMPT = "Ты — русскоязычный энциклопедический ассистент. Отвечай кратко и точно."
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-DEFAULT_MODEL_PATH = "./model_weights"
-FALLBACK_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
-DATASET_NAME = "danasone/wikipedia_ru"
-SYSTEM_PROMPT = (
-    "Ты — русскоязычный энциклопедический ассистент. "
-    "Отвечай кратко и точно."
-)
-MAX_NEW_TOKENS = 200
-MAX_INPUT_LENGTH = 512
-
-
-def clean_wiki_text(text: str) -> str:
-    text = re.sub(r"\(\s*\)", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+SAMPLE_DATA = [
+    {
+        "prompt": "Что такое фотосинтез?",
+        "reference": "Фотосинтез — это процесс образования органических веществ из углекислого газа и воды на свету при участии фотосинтетических пигментов (хлорофилла у растений)."
+    },
+    {
+        "prompt": "Кто написал роман «Преступление и наказание»?",
+        "reference": "Роман «Преступление и наказание» написал русский писатель Фёдор Михайлович Достоевский в 1866 году."
+    },
+    {
+        "prompt": "Какая самая длинная река в Европе?",
+        "reference": "Самая длинная река в Европе — Волга, её длина составляет 3530 километров."
+    },
+]
 
 
-def get_first_paragraphs(text: str, max_chars: int = 800) -> str:
-    sentences = text.split(". ")
-    result = ""
-    for s in sentences:
-        if len(result) + len(s) < max_chars:
-            result += s + ". "
-        else:
-            break
-    return result.strip()
+class CyrillicTokenizer:
+    def tokenize(self, text: str):
+        return re.findall(r"[а-яА-ЯёЁa-zA-Z0-9]+", text.lower())
 
 
-def load_model(model_path: str):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
-
-    path = model_path if os.path.exists(f"{model_path}/config.json") else FALLBACK_MODEL
-    logger.info("Загрузка модели из '%s' на %s (%s)...", path, device, dtype)
-
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        path,
-        torch_dtype=dtype,
-    ).to(device)
-    model.eval()
-    logger.info("Модель загружена.")
-    return model, tokenizer, device
+def load_dataset(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        print(f"[!] {path} не найден. Используется встроенный тестовый набор ({len(SAMPLE_DATA)} примеров).\n")
+        return SAMPLE_DATA
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
-@torch.no_grad()
-def generate_answer(
-    model,
-    tokenizer,
-    device,
-    question: str,
-    max_new_tokens: int = MAX_NEW_TOKENS,
-) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question.strip()},
-    ]
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_INPUT_LENGTH,
-    ).to(device)
-    input_len = inputs.input_ids.shape[1]
-
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=0.3,
-        top_p=0.85,
-        top_k=40,
-        repetition_penalty=1.1,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    answer = tokenizer.decode(
-        output_ids[0][input_len:],
-        skip_special_tokens=True,
-    ).strip()
-    return answer
+def has_cjk_leak(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
 
 
-def build_eval_set(num_samples: int, offset: int):
-    logger.info(
-        "Загрузка '%s' (offset=%d, samples=%d)...",
-        DATASET_NAME, offset, num_samples,
-    )
-    ds = load_dataset(DATASET_NAME, split="train", streaming=True)
+def run_inference(llm: Llama, dataset: list[dict], max_tokens: int = 200) -> dict:
+    preds = []
+    latencies = []
+    tps_list = []
+    cjk_leaks = 0
+    max_token_hits = 0
 
-    questions, references = [], []
-    skipped = 0
-    for item in ds:
-        if skipped < offset:
-            skipped += 1
-            continue
+    for item in dataset:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": item["prompt"].strip()},
+        ]
 
-        title = item.get("title", "").strip()
-        text = clean_wiki_text(item.get("text", ""))
-        summary = get_first_paragraphs(text)
+        t0 = time.perf_counter()
+        out = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            top_p=0.85,
+            top_k=40,
+            stop=["<|im_end|>"],
+        )
+        elapsed = time.perf_counter() - t0
 
-        if len(summary) < 150:
-            continue
+        text = out["choices"][0]["message"]["content"].strip()
+        comp_tokens = out["usage"]["completion_tokens"]
 
-        questions.append(f"Что такое {title}?")
-        references.append(summary)
+        preds.append(text)
+        latencies.append(elapsed)
+        tps_list.append(comp_tokens / elapsed if elapsed > 0 else 0)
 
-        if len(questions) >= num_samples:
-            break
+        if has_cjk_leak(text):
+            cjk_leaks += 1
+        if comp_tokens >= max_tokens:
+            max_token_hits += 1
 
-    logger.info("Собрано %d пар (вопрос → эталон).", len(questions))
-    return questions, references
+    return {
+        "preds": preds,
+        "avg_latency": sum(latencies) / len(latencies),
+        "avg_tps": sum(tps_list) / len(tps_list),
+        "cjk_leak_rate": (cjk_leaks / len(dataset)) * 100,
+        "max_token_rate": (max_token_hits / len(dataset)) * 100,
+    }
+
+
+def compute_metrics(preds: list[str], refs: list[str]) -> dict:
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False, tokenizer=CyrillicTokenizer())
+    rouge_l_scores = [scorer.score(ref, pred)["rougeL"].fmeasure for ref, pred in zip(refs, preds)]
+    avg_rouge_l = sum(rouge_l_scores) / len(rouge_l_scores)
+
+    bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+
+    _, _, f1 = bert_score(preds, refs, lang="ru", verbose=False)
+    avg_bert_f1 = f1.mean().item()
+
+    return {
+        "rougeL": avg_rouge_l,
+        "bleu": bleu,
+        "bert_f1": avg_bert_f1,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default=DEFAULT_MODEL_PATH,
-        help="Путь к дообученной модели (или Hub ID).",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=200,
-        help="Сколько примеров использовать для оценки.",
-    )
-    parser.add_argument(
-        "--offset",
-        type=int,
-        default=5000,
-        help="Сколько статей пропустить (чтобы не пересекаться с train).",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./eval_results",
-        help="Куда сохранять метрики и примеры.",
-    )
-    parser.add_argument(
-        "--bertscore_model",
-        type=str,
-        default="bert-base-multilingual-cased",
-        help=(
-            "Модель для BERTScore. Для лучшей корреляции с человеком "
-            "можно попробовать 'microsoft/deberta-xlarge-mnli' (тяжелее)."
-        ),
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=8,
-        help="Батч для перплексии и BERTScore.",
-    )
-    args = parser.parse_args()
+    dataset = load_dataset(VAL_FILE)
+    refs = [d["reference"] for d in dataset]
+    n_threads = int(os.getenv("LLM_THREADS", os.cpu_count() or 4))
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print("1/2 Запуск базовой модели (без LoRA)...")
+    base_llm = Llama(model_path=MODEL_PATH, lora_path=None, n_ctx=2048, n_threads=n_threads, verbose=False)
+    base_res = run_inference(base_llm, dataset)
+    del base_llm
 
-    model, tokenizer, device = load_model(args.model_path)
+    print("2/2 Запуск дообученной модели (с LoRA)...")
+    lora_llm = Llama(model_path=MODEL_PATH, lora_path=LORA_PATH, n_ctx=2048, n_threads=n_threads, verbose=False)
+    lora_res = run_inference(lora_llm, dataset)
+    del lora_llm
 
-    questions, references = build_eval_set(args.num_samples, args.offset)
-    if not references:
-        raise RuntimeError("Не удалось собрать ни одного валидного примера.")
+    print("Расчёт метрик (ROUGE-L, BLEU, BERTScore)...\n")
+    base_m = compute_metrics(base_res["preds"], refs)
+    lora_m = compute_metrics(lora_res["preds"], refs)
 
-    logger.info("Генерация ответов...")
-    predictions = []
-    for q in tqdm(questions, desc="Generate"):
-        try:
-            ans = generate_answer(model, tokenizer, device, q)
-        except Exception as e:
-            logger.warning("Ошибка генерации для '%s': %s", q, e)
-            ans = ""
-        predictions.append(ans)
+    print("=" * 66)
+    print(f"{'Метрика':<30} | {'Base Model':<14} | {'LoRA Model':<14}")
+    print("-" * 66)
+    print(f"{'ROUGE-L (выше = лучше)':<30} | {base_m['rougeL']:<14.4f} | {lora_m['rougeL']:<14.4f}")
+    print(f"{'SacreBLEU (выше = лучше)':<30} | {base_m['bleu']:<14.2f} | {lora_m['bleu']:<14.2f}")
+    print(f"{'BERTScore F1 (выше = лучше)':<30} | {base_m['bert_f1']:<14.4f} | {lora_m['bert_f1']:<14.4f}")
+    print(f"{'Утечка иероглифов (ниже = лучше)':<30} | {base_res['cjk_leak_rate']:<13.1f}% | {lora_res['cjk_leak_rate']:<13.1f}%")
+    print(f"{'Упор в max_tokens (ниже = лучше)':<30} | {base_res['max_token_rate']:<13.1f}% | {lora_res['max_token_rate']:<13.1f}%")
+    print(f"{'Скорость (токен/сек)':<30} | {base_res['avg_tps']:<14.1f} | {lora_res['avg_tps']:<14.1f}")
+    print(f"{'Средняя задержка (сек)':<30} | {base_res['avg_latency']:<14.2f} | {lora_res['avg_latency']:<14.2f}")
+    print("=" * 66)
 
-    valid = [(p, r) for p, r in zip(predictions, references) if p.strip()]
-    if not valid:
-        raise RuntimeError("Все сгенерированные ответы пусты — метрики не посчитать.")
-    preds_valid, refs_valid = zip(*valid)
-    logger.info(
-        "Валидных пар: %d из %d (пустых: %d).",
-        len(preds_valid), len(predictions), len(predictions) - len(preds_valid),
-    )
-
-    results = {"num_samples": len(predictions), "num_valid": len(preds_valid)}
-
-    logger.info("Считаем ROUGE...")
-    rouge = evaluate.load("rouge")
-    rouge_res = rouge.compute(
-        predictions=list(preds_valid),
-        references=list(refs_valid),
-    )
-    results.update({f"rouge_{k}": float(v) for k, v in rouge_res.items()})
-
-    logger.info("Считаем BLEU...")
-    bleu = evaluate.load("bleu")
-    bleu_res = bleu.compute(
-        predictions=list(preds_valid),
-        references=[[r] for r in refs_valid],
-    )
-    results["bleu"] = float(bleu_res["bleu"])
-
-    logger.info("Считаем BERTScore (lang=ru, model=%s)...", args.bertscore_model)
-    bertscore = evaluate.load("bertscore")
-    bs_res = bertscore.compute(
-        predictions=list(preds_valid),
-        references=list(refs_valid),
-        lang="ru",
-        model_type=args.bertscore_model,
-        device=device,
-        batch_size=args.batch_size,
-    )
-    results["bertscore_precision"] = float(
-        sum(bs_res["precision"]) / len(bs_res["precision"])
-    )
-    results["bertscore_recall"] = float(
-        sum(bs_res["recall"]) / len(bs_res["recall"])
-    )
-    results["bertscore_f1"] = float(sum(bs_res["f1"]) / len(bs_res["f1"]))
-
-    logger.info("Считаем Perplexity на эталонных текстах...")
-    try:
-        ppl = evaluate.load("perplexity", module_type="metric")
-        ppl_res = ppl.compute(
-            model_id=args.model_path,
-            predictions=list(refs_valid),
-            batch_size=args.batch_size,
-            device=device,
-        )
-        results["perplexity_mean"] = float(ppl_res["mean_perplexity"])
-    except Exception as e:
-        logger.warning("Не удалось посчитать Perplexity: %s", e)
-        results["perplexity_mean"] = None
-
-    metrics_path = output_dir / "metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    logger.info("Метрики сохранены в %s", metrics_path)
-
-    examples_path = output_dir / "examples.json"
-    examples = [
-        {
-            "question": q,
-            "reference": r,
-            "prediction": p,
-        }
-        for q, r, p in zip(questions, references, predictions)
-    ]
-    with open(examples_path, "w", encoding="utf-8") as f:
-        json.dump(examples, f, ensure_ascii=False, indent=2)
-    logger.info("Примеры сохранены в %s", examples_path)
-
-    print("\n=== Итоговые метрики ===")
-    for k, v in results.items():
-        if isinstance(v, float):
-            print(f"{k:>20}: {v:.4f}")
-        else:
-            print(f"{k:>20}: {v}")
+    print("\n--- Примеры ответов (первые 3) ---")
+    for i in range(min(3, len(dataset))):
+        print(f"\n[Промпт]: {dataset[i]['prompt']}")
+        print(f"[Эталон]: {refs[i]}")
+        print(f"[Base]  : {base_res['preds'][i]}")
+        print(f"[LoRA]  : {lora_res['preds'][i]}")
 
 
 if __name__ == "__main__":
