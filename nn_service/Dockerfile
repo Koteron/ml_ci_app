@@ -1,13 +1,18 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+ENV CMAKE_BUILD_PARALLEL_LEVEL=1
+RUN pip install --no-cache-dir llama-cpp-python==0.3.2
+
 COPY worker.py .
-RUN mkdir -p /app/model_weights
 
 CMD ["python", "-u", "worker.py"]
